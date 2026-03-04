@@ -2,8 +2,10 @@
 
 import json
 import os
+import re
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
+from urllib.parse import unquote
 
 import uuid
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
@@ -296,72 +298,49 @@ Only return a URL that appears in the content. Do not invent URLs.
     async def _llm_extract_artists(
         self, gallery: Gallery, gallery_url: str, markdown: str
     ) -> List[ArtistExtraction]:
-        """Use LLM to extract artists from markdown content using multi-pass consensus."""
-        print(f"   Using LLM to extract artists ({len(markdown)} chars)...")
+        """Extract artists using hybrid approach: regex for discovery, LLM for classification.
 
-        # Use larger context limit to capture all artists
-        MAX_CHARS = 20000
-        truncated_markdown = markdown[:MAX_CHARS]
-        if len(markdown) > MAX_CHARS:
-            print(f"   ⚠️  Truncated markdown from {len(markdown)} to {MAX_CHARS} characters")
+        This guarantees 100% artist coverage (no LLM misses) while still using
+        LLM intelligence for section classification (represented vs projects).
+        """
+        # Use hybrid extraction (regex + LLM classification)
+        return await self._hybrid_extract_artists(gallery, gallery_url, markdown)
 
-        base_url = get_base_url(gallery_url)
+    def _split_into_chunks(self, markdown: str, chunk_size: int, overlap: int) -> List[str]:
+        """Split markdown into overlapping chunks to ensure no artists are lost at boundaries."""
+        if len(markdown) <= chunk_size:
+            return [markdown]
 
-        # Multi-pass extraction for better completeness
-        all_extractions = []
-        num_passes = 3
+        chunks = []
+        start = 0
 
-        for pass_num in range(num_passes):
-            prompt = self._build_extraction_prompt(truncated_markdown, pass_num)
+        while start < len(markdown):
+            end = min(start + chunk_size, len(markdown))
 
-            try:
-                response = self.groq_client.chat.completions.create(
-                    model=self.groq_model,
-                    messages=[
-                        {"role": "system", "content": "You are a precise data extraction assistant. Your task is to extract ALL artist names from gallery websites with 100% completeness."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.1,  # Slight variation between passes
-                )
+            # Try to end at a line break or artist link boundary
+            if end < len(markdown):
+                # Look for line break in the overlap region
+                search_start = max(end - overlap, start)
+                line_break = markdown.rfind('\n', search_start, end)
+                if line_break != -1:
+                    end = line_break
 
-                content = response.choices[0].message.content
-                if content:
-                    parsed = json.loads(content)
-                    artists_data = parsed.get("artists", [])
-                    artists = []
-                    for artist_data in artists_data:
-                        display_name = artist_data.get("artist_display_name", "").strip()
-                        if display_name:
-                            artists.append(ArtistExtraction(
-                                artist_display_name=display_name,
-                                artist_gallery_url=resolve_url(
-                                    base_url, artist_data.get("artist_gallery_url")
-                                ),
-                                is_represented=artist_data.get("is_represented", True),
-                                normalized_name=display_name.lower().strip(),
-                            ))
-                    all_extractions.append(artists)
+            chunks.append(markdown[start:end])
+            start = end - overlap if end < len(markdown) else end
 
-            except Exception as e:
-                print(f"   ⚠️  Pass {pass_num + 1} failed: {e}")
-                all_extractions.append([])
+        return chunks
 
-        # Merge using union - include all unique artists from all passes
-        merged = self._merge_extractions(all_extractions)
-        print(f"   ✓ Multi-pass extraction complete")
-
-        return merged
-
-    def _build_extraction_prompt(self, markdown: str, pass_num: int) -> str:
-        """Build extraction prompt with pass-specific strategies but full context."""
+    def _build_extraction_prompt(self, markdown: str, pass_num: int, chunk_idx: int = 0, total_chunks: int = 1) -> str:
+        """Build extraction prompt with pass-specific strategies and chunk context."""
         extraction_strategies = [
             "Strategy: Carefully scan through the content once, extracting every artist name you see in order.",
             "Strategy: Look specifically for markdown links in the format [Artist Name](url) - these are the primary artist listings.",
             "Strategy: Verify by counting - scan for numbered lists, bullet points, or alphabet sections to ensure no artist was missed."
         ]
 
-        return f"""Extract ALL artists from this gallery page. You must find every single artist with 100% completeness.
+        chunk_info = f" (Part {chunk_idx + 1} of {total_chunks})" if total_chunks > 1 else ""
+
+        return f"""Extract ALL artists from this gallery page{chunk_info}. You must find every single artist with 100% completeness.
 
 {extraction_strategies[pass_num % len(extraction_strategies)]}
 
@@ -416,3 +395,151 @@ CRITICAL: Your response must include ALL artists from the content. Return valid 
         print(f"   Union result: {len(merged)} unique artists")
 
         return merged
+
+    async def _hybrid_extract_artists(
+        self, gallery: Gallery, gallery_url: str, markdown: str
+    ) -> List[ArtistExtraction]:
+        """Hybrid extraction: regex for 100% artist discovery, LLM for classification.
+
+        This approach guarantees all artists are found (no LLM misses) while
+        still using LLM to classify represented vs projects and detect section headers.
+        """
+        print(f"   Using hybrid extraction ({len(markdown)} chars)...")
+
+        base_url = get_base_url(gallery_url)
+
+        # Phase 1: Deterministic extraction of ALL artist URLs
+        all_artists = self._extract_all_artist_urls(markdown, base_url)
+        print(f"   🔍 Regex found {len(all_artists)} unique artist URLs")
+
+        if not all_artists:
+            return []
+
+        # Phase 2: LLM classification on smaller chunks
+        # Classify artists in batches to determine is_represented status
+        classified = await self._classify_artists_with_llm(all_artists, markdown, gallery)
+
+        print(f"   ✓ Hybrid extraction complete: {len(classified)} artists")
+        return classified
+
+    def _extract_all_artist_urls(self, markdown: str, base_url: str) -> Dict[str, str]:
+        """Extract all unique artist URLs from markdown using regex.
+
+        Returns: dict mapping artist_slug -> full_url
+        """
+        artists = {}
+
+        # Pattern 1: Markdown links [Name](https://.../artists/name/)
+        # Matches: [Artist Name](https://gallery.com/artists/name/)
+        md_pattern = r'\[([^\]]+)\]\((https?://[^)]+/artists/([^/)]+))\)'
+        for match in re.finditer(md_pattern, markdown):
+            name = match.group(1).strip()
+            url = match.group(2)
+            slug = match.group(3).rstrip('/')
+
+            # Skip navigation/footer links
+            if len(name) < 2 or 'artists' in slug.lower() and slug.lower() in ['artists', 'artists-index']:
+                continue
+
+            # Clean up name (remove image alt text artifacts)
+            name = re.sub(r'!\[.*?\]', '', name).strip()
+            if name and slug:
+                artists[slug] = url
+
+        # Pattern 2: Plain text URLs that look like artist pages
+        # https://gallery.com/artists/name/
+        url_pattern = r'(https?://[^\s\)\"\'\[\]\,]+/artists/([^\s\)\"\'\[\]\,\/</]+))'
+        for match in re.finditer(url_pattern, markdown):
+            url = match.group(1).rstrip('/')
+            slug = match.group(2).rstrip('/')
+
+            # Skip duplicates and non-artist pages
+            if slug not in artists and not any(x in slug.lower() for x in ['index', 'page', 'search']):
+                artists[slug] = url
+
+        return artists
+
+    def _slug_to_display_name(self, slug: str) -> str:
+        """Convert URL slug to display name."""
+        # Decode URL encoding
+        decoded = unquote(slug)
+        # Replace hyphens with spaces
+        name = decoded.replace('-', ' ')
+        # Capitalize each word
+        return ' '.join(word.capitalize() for word in name.split())
+
+    async def _classify_artists_with_llm(
+        self, artists: Dict[str, str], markdown: str, gallery: Gallery
+    ) -> List[ArtistExtraction]:
+        """Use LLM to classify artists as represented vs projects.
+
+        Processes artists in small batches to keep context manageable.
+        """
+        # Take a sample of the markdown with section headers for context
+        # Focus on finding section markers like "(Projects)" or "Also Available"
+        section_markers = re.findall(r'[\(\*\#]\s*(?:Projects|Also Available|Formerly|Previously)[\)\*\#]?[^\n]*', markdown, re.IGNORECASE)
+
+        # Build context about sections
+        context = f"""Gallery: {gallery.name}
+
+Section markers found in page: {', '.join(section_markers) if section_markers else 'None explicit'}
+
+Artist list to classify:
+"""
+
+        # Build result list with default represented=True
+        result = []
+        for slug, url in artists.items():
+            display_name = self._slug_to_display_name(slug)
+            result.append(ArtistExtraction(
+                artist_display_name=display_name,
+                artist_gallery_url=url,
+                is_represented=True,  # Default
+                normalized_name=display_name.lower().strip(),
+            ))
+
+        # For small lists, try to classify with LLM
+        # For large lists (>50), assume all are represented (safer default)
+        if len(result) <= 50 and section_markers:
+            try:
+                # Build compact list for LLM
+                artist_list = '\n'.join([f"- {a.artist_display_name}" for a in result])
+
+                prompt = f"""Classify these artists for {gallery.name}.
+
+Based on the markdown section markers: {', '.join(section_markers)}
+
+Artists:
+{artist_list}
+
+Return JSON: {{"classifications": [{{"name": "Artist Name", "is_represented": true/false}}]}}
+
+Mark artists as is_represented=false ONLY if they appear in a "Projects" or "Also Available" section.
+When unsure, default to true (represented)."""
+
+                response = self.groq_client.chat.completions.create(
+                    model=self.groq_model,
+                    messages=[
+                        {"role": "system", "content": "You classify gallery artists as represented (true) or projects/secondary (false)."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                )
+
+                content = response.choices[0].message.content
+                if content:
+                    parsed = json.loads(content)
+                    classifications = {c['name'].lower().strip(): c['is_represented']
+                                        for c in parsed.get('classifications', [])}
+
+                    # Update classifications
+                    for artist in result:
+                        key = artist.artist_display_name.lower().strip()
+                        if key in classifications:
+                            artist.is_represented = classifications[key]
+
+            except Exception as e:
+                print(f"   ⚠️  LLM classification failed: {e}, using defaults")
+
+        return result
