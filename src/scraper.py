@@ -72,12 +72,14 @@ class GalleryScraper:
         Discover the artists page URL.
 
         Strategy:
-        1. Try /artists first
-        2. If that fails, fetch homepage and use LLM
+        1. Try /artists/index/ first (comprehensive alphabetical listing)
+        2. Fall back to /artists/ (current roster only)
+        3. If both fail, use LLM to discover from homepage
         """
         base_url = get_base_url(gallery_url)
 
-        # Try /artists first
+        # Try /artists/index/ first (usually has complete historical roster)
+        index_url = f"{base_url}/artists/index/"
         artists_url = f"{base_url}/artists"
 
         browser_config = BrowserConfig(
@@ -95,12 +97,18 @@ class GalleryScraper:
 
         try:
             async with AsyncWebCrawler(config=browser_config) as crawler:
-                result = await crawler.arun(url=artists_url, config=crawl_config)
+                # First try /artists/index/ (usually has complete historical roster)
+                result = await crawler.arun(url=index_url, config=crawl_config)
+                if result.success and result.markdown and len(result.markdown) > 500:
+                    # Check for alphabetical index markers (### A, ### B, etc.)
+                    if re.search(r'### [A-Z]', result.markdown):
+                        print(f"   ✓ Found comprehensive index: {index_url}")
+                        return index_url
 
-                # Check if page loaded successfully and has content
+                # Fall back to /artists/ (current roster only)
+                result = await crawler.arun(url=artists_url, config=crawl_config)
                 if result.success and result.markdown and len(result.markdown) > 100:
                     # Quick check: does it look like an artists page?
-                    # We look for multiple artist-like patterns
                     markdown_lower = result.markdown.lower()
                     artist_indicators = [
                         "artist",
