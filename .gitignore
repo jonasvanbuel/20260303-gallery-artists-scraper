@@ -248,3 +248,6 @@ settings.local.py
 
 # Cursor IDE
 .cursor/
+
+# Output directory (scraped data, debug files, screenshots)
+output/
