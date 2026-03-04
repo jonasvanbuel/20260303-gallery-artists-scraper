@@ -20,7 +20,7 @@ AI-powered scraper that extracts artist relationships from gallery websites and 
 
 2. **Install dependencies:**
    ```bash
-   pip install -e .
+   pip install -r requirements.txt
    crawl4ai-setup  # Installs Playwright browsers
    ```
 
@@ -78,6 +78,7 @@ Results are saved to `output/results.jsonl` for debugging/audit purposes. The ma
 
 ## Architecture
 
+- **requirements.txt**: Python dependencies
 - **config.py**: Environment variables and settings
 - **models.py**: Pydantic data models
 - **database.py**: Supabase client operations
@@ -188,7 +189,7 @@ GROUP BY g.name;
 
 **Import errors**: Ensure your virtual environment is activated and run:
 ```bash
-pip install -e .
+pip install -r requirements.txt
 ```
 
 **Playwright errors**: Run `crawl4ai-setup` or `playwright install chromium`
