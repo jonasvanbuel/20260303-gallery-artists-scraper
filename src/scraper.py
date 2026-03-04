@@ -510,30 +510,88 @@ CRITICAL: Your response must include ALL artists from the content. Return valid 
         Returns: dict mapping artist_slug -> (artist_name, full_url)
         The artist_name is extracted from the markdown link text (e.g., "[Artist Name](url)")
         """
+        import re
         artists = {}
 
-        # Pattern 1: Markdown links [Name](https://.../artists/name/)
-        # Matches: [Artist Name](https://gallery.com/artists/name/)
-        # Also handles formats like: * ### [Artist Name](url)
-        md_pattern = r'\[([^\]]+)\]\((https?://[^)]+/artists/([^/)]+))\)'
-        for match in re.finditer(md_pattern, markdown):
-            name = match.group(1).strip()
-            url = match.group(2)
-            slug = match.group(3).rstrip('/')
+        # Truncate markdown at section markers that indicate non-represented artists
+        section_markers = [
+            'Additional Artists Exhibited',
+            'Also Available By',
+            'Past Artists',
+            'Former Artists',
+        ]
+        for marker in section_markers:
+            if marker in markdown:
+                markdown = markdown.split(marker)[0]
+                break
 
-            # Skip navigation/footer links
-            if len(name) < 2 or slug.lower() in ['artists', 'artists-index', 'index', '']:
+        # Pattern 1: Markdown links with embedded images [ ![](image) Name ](url)
+        # Handles formats like: * [ ![](image_url) Artist Name ](artist_url)
+        # The pattern captures the name from link text, not from the URL slug
+        # Note: URLs may end with /) so we make the trailing slash optional
+        md_pattern_img = r'\[\s*(!\[[^\]]*\]\([^)]+\))\s*([^\]]+?)\s*\]\((https?://[^)]+/artists/([^/)]+)/?)\)'
+        for match in re.finditer(md_pattern_img, markdown):
+            name = match.group(2).strip()  # Group 2 is the artist name from link text
+            url = match.group(3)  # Group 3 is the URL
+            slug = match.group(4).rstrip('/')  # Group 4 is the slug
+
+            # Skip navigation/footer links and false positives
+            if len(name) < 2 or slug.lower() in ['artists', 'artists-index', 'index', 'all', '', '#main_content']:
                 continue
 
-            # Clean up name (remove image alt text artifacts like ![alt])
-            name = re.sub(r'!\[.*?\]', '', name).strip()
-            # Remove markdown formatting (###, ##, etc.)
+            # Skip navigation links by name
+            nav_names = ['skip to main content', 'skip', 'main content', 'menu', 'home', 'next', 'previous']
+            if name.lower() in nav_names:
+                continue
+
+            # Skip placeholder/default entries
+            if name.startswith('_') or 'default' in name.lower():
+                continue
+
+            # Remove any markdown formatting (###, ##, etc.)
             name = re.sub(r'^#+\s*', '', name).strip()
+
+            # Clean up estate/foundation references
+            name = self._clean_artist_name(name)
 
             if name and slug:
                 artists[slug] = (name, url)
 
-        # Pattern 2: Plain text URLs that look like artist pages (fallback)
+        # Pattern 2: Simple markdown links [Name](https://.../artists/name/)
+        # For galleries without image tags in links
+        md_pattern_simple = r'\[([^\]]+)\]\((https?://[^)]+/artists/([^/)]+))\)'
+        for match in re.finditer(md_pattern_simple, markdown):
+            name = match.group(1).strip()
+            url = match.group(2)
+            slug = match.group(3).rstrip('/')
+
+            # Skip if already found via pattern 1
+            if slug in artists:
+                continue
+
+            # Skip navigation/footer links and false positives
+            if len(name) < 2 or slug.lower() in ['artists', 'artists-index', 'index', 'all', '', '#main_content']:
+                continue
+
+            # Skip navigation links by name
+            nav_names = ['skip to main content', 'skip', 'main content', 'menu', 'home', 'next', 'previous']
+            if name.lower() in nav_names:
+                continue
+
+            # Skip placeholder/default entries
+            if name.startswith('_') or 'default' in name.lower():
+                continue
+
+            # Clean up name (remove markdown formatting)
+            name = re.sub(r'^#+\s*', '', name).strip()
+
+            # Clean up estate/foundation references
+            name = self._clean_artist_name(name)
+
+            if name and slug:
+                artists[slug] = (name, url)
+
+        # Pattern 3: Plain text URLs that look like artist pages (fallback)
         # Only use this if we didn't already find the artist via markdown link
         url_pattern = r'(https?://[^\s\)\"\'\[\]\,]+/artists/([^\s\)\"\'\[\]\,\/</]+))'
         for match in re.finditer(url_pattern, markdown):
@@ -541,9 +599,18 @@ CRITICAL: Your response must include ALL artists from the content. Return valid 
             slug = match.group(2).rstrip('/')
 
             # Skip duplicates and non-artist pages
-            if slug not in artists and not any(x in slug.lower() for x in ['index', 'page', 'search']):
+            if slug not in artists and not any(x in slug.lower() for x in ['index', 'page', 'search', 'all', 'default', '#main_content', '#']):
                 # Convert slug to display name as fallback
                 display_name = self._slug_to_display_name(slug)
+                # Clean up any estate/foundation references from slug-derived names
+                display_name = self._clean_artist_name(display_name)
+                # Skip navigation links by name (for slug-derived names)
+                nav_names = ['skip to main content', 'skip', 'main content', 'menu', 'home', 'next', 'previous']
+                if display_name.lower() in nav_names:
+                    continue
+                # Skip placeholder entries
+                if display_name.startswith('_') or 'default' in display_name.lower():
+                    continue
                 artists[slug] = (display_name, url)
 
         return artists
@@ -558,6 +625,36 @@ CRITICAL: Your response must include ALL artists from the content. Return valid 
         name = name.strip()
         # Capitalize each word
         return ' '.join(word.capitalize() for word in name.split())
+
+    def _clean_artist_name(self, name: str) -> str:
+        """Clean up estate/foundation/work references from artist names.
+
+        Converts names like "The estate of Karel Appel" to "Karel Appel".
+        Also handles: "The work of [Name]", ALL CAPS names, etc.
+        """
+        original = name.strip()
+        cleaned = original
+
+        # Pattern 0: Remove leading numbers (e.g., "336 Pawe Althamer" -> "Pawe Althamer")
+        cleaned = re.sub(r'^\d+\s+', '', cleaned)
+
+        # Pattern 1: "the estate of [name]" or "estate of [name]"
+        cleaned = re.sub(r'^(?:the\s+)?estate\s+of\s+', '', cleaned, flags=re.IGNORECASE)
+
+        # Pattern 2: "the work of [name]" or "work of [name]"
+        cleaned = re.sub(r'^(?:the\s+)?work\s+of\s+', '', cleaned, flags=re.IGNORECASE)
+
+        # Pattern 3: "[name] estate" or "[name] foundation"
+        cleaned = re.sub(r'\s+(?:estate|foundation)$', '', cleaned, flags=re.IGNORECASE)
+
+        # Pattern 4: "the [name] foundation" (with optional "the")
+        cleaned = re.sub(r'^(?:the\s+)?(.+?)\s+foundation$', r'\1', cleaned, flags=re.IGNORECASE)
+
+        # Convert ALL CAPS to Title Case (e.g., "EILEEN AGAR" -> "Eileen Agar")
+        if cleaned.isupper():
+            cleaned = cleaned.title()
+
+        return cleaned.strip()
 
     async def _classify_artists_with_llm(
         self, artists: Dict[str, Tuple[str, str]], markdown: str, gallery: Gallery
