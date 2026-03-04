@@ -203,3 +203,19 @@ pip install -r requirements.txt
 **RLS errors**: Ensure you're using the service_role key, not anon key
 
 **Rate limiting**: Increase `DELAY_BETWEEN_GALLERIES` in .env
+
+## Gallery Artist Counts (Reference)
+
+Tested galleries and their artist counts (as of March 2026):
+
+| Gallery | Artists | URL |
+|---------|---------|-----|
+| **Gagosian** | 291 | gagosian.com |
+| **Almine Rech** | 106 | alminerech.com |
+| **David Zwirner** | 85 | davidzwirner.com |
+| **Andrew Kreps Gallery** | 40 | andrewkreps.com |
+| **Thomas Dane Gallery** | 38 | thomasdanegallery.com |
+| **Antenna Space** | 27 | antenna-space.com |
+| **Axel Vervoordt Gallery** | 55 | axelvervoordtgallery.com |
+
+*Note: These counts are for reference only and may change as galleries update their rosters.*
