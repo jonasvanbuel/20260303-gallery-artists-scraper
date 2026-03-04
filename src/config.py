@@ -18,6 +18,10 @@ class Config:
 
     # Groq
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    # Available models on Groq (as of 2026-03-04):
+    # - llama-3.3-70b-versatile (default, good balance)
+    # - qwen-2.5-32b (excellent for structured data extraction)
+    # - deepseek-r1-distill-llama-70b (good for complex reasoning)
     GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
     # Scraping

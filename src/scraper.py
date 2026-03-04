@@ -11,54 +11,7 @@ from groq import Groq
 
 from config import Config
 from models import ArtistExtraction, Gallery
-from utils import ensure_https, get_base_url, resolve_url
-
-
-# JavaScript code for gradual scrolling to load lazy-loaded content
-GRADUAL_SCROLL_JS = """
-async () => {
-    const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-    let scrollHeight = document.body.scrollHeight;
-    const viewportHeight = window.innerHeight;
-    let currentPosition = 0;
-    let iterations = 0;
-    const maxIterations = 50;
-    const initialHeight = scrollHeight;
-
-    console.log(`[Scroll] Starting. Initial height: ${initialHeight}px, viewport: ${viewportHeight}px`);
-
-    // Scroll down gradually to trigger lazy loading
-    while (currentPosition < scrollHeight && iterations < maxIterations) {
-        currentPosition += Math.floor(viewportHeight * 0.7);  // Scroll 70% of viewport
-        window.scrollTo(0, currentPosition);
-        await delay(800);  // Wait for lazy loading
-
-        // Update scroll height in case content was added
-        const newScrollHeight = document.body.scrollHeight;
-        if (newScrollHeight > scrollHeight) {
-            console.log(`[Scroll] Height expanded: ${scrollHeight} -> ${newScrollHeight}`);
-            scrollHeight = newScrollHeight;
-        }
-
-        iterations++;
-    }
-
-    console.log(`[Scroll] Completed. Final height: ${scrollHeight}px, iterations: ${iterations}`);
-
-    // Scroll back to top then down once more to ensure everything loaded
-    window.scrollTo(0, 0);
-    await delay(500);
-    window.scrollTo(0, document.body.scrollHeight);
-    await delay(1000);
-
-    return {
-        initialHeight: initialHeight,
-        finalHeight: scrollHeight,
-        iterations: iterations,
-        scrollComplete: true
-    };
-}
-"""
+from utils import ensure_https, get_base_url, resolve_url, GRADUAL_SCROLL_JS
 
 
 class GalleryScraper:
@@ -132,7 +85,7 @@ class GalleryScraper:
         )
 
         crawl_config = CrawlerRunConfig(
-            wait_until="networkidle",
+            wait_until="domcontentloaded",
             page_timeout=Config.PAGE_TIMEOUT,
             word_count_threshold=10,
             js_code=GRADUAL_SCROLL_JS,
@@ -178,7 +131,7 @@ class GalleryScraper:
         )
 
         crawl_config = CrawlerRunConfig(
-            wait_until="networkidle",
+            wait_until="domcontentloaded",
             page_timeout=Config.PAGE_TIMEOUT,
             word_count_threshold=10,
             js_code=GRADUAL_SCROLL_JS,
@@ -254,7 +207,7 @@ Only return a URL that appears in the content. Do not invent URLs.
         )
 
         crawl_config = CrawlerRunConfig(
-            wait_until="networkidle",
+            wait_until="domcontentloaded",
             page_timeout=Config.PAGE_TIMEOUT,
             word_count_threshold=10,
             js_code=GRADUAL_SCROLL_JS,
@@ -343,73 +296,123 @@ Only return a URL that appears in the content. Do not invent URLs.
     async def _llm_extract_artists(
         self, gallery: Gallery, gallery_url: str, markdown: str
     ) -> List[ArtistExtraction]:
-        """Use LLM to extract artists from markdown content."""
+        """Use LLM to extract artists from markdown content using multi-pass consensus."""
         print(f"   Using LLM to extract artists ({len(markdown)} chars)...")
 
         # Use larger context limit to capture all artists
-        # Groq models typically have 8K context, ~6000 tokens available for input
-        # 1 token ~ 4 characters, so 20000 chars ~ 5000 tokens is safe
         MAX_CHARS = 20000
         truncated_markdown = markdown[:MAX_CHARS]
         if len(markdown) > MAX_CHARS:
             print(f"   ⚠️  Truncated markdown from {len(markdown)} to {MAX_CHARS} characters")
 
-        prompt = f"""System: You are extracting artist data from a gallery website.
-Return valid JSON only, no explanation.
+        base_url = get_base_url(gallery_url)
 
-User: Extract ALL artists from this gallery page. I need every single artist listed, not just a sample. For each artist:
-- artist_display_name: Full name as shown
-- artist_gallery_url: Link to their profile page (if available)
-- is_represented: true if they appear to be formally represented (e.g., under "Represented" section),
-  false if they're only in "Projects" or secondary offerings
+        # Multi-pass extraction for better completeness
+        all_extractions = []
+        num_passes = 3
 
-Important:
-- Extract EVERY artist you can find in the content below
-- Look for patterns like "[Artist Name](url)" or headings with artist names
-- Ignore artists mentioned only in passing (press quotes, etc.)
-- If the page distinguishes "Represented" vs "Projects" artists, mark accordingly
-- Resolve relative URLs to absolute URLs
+        for pass_num in range(num_passes):
+            prompt = self._build_extraction_prompt(truncated_markdown, pass_num)
 
-Return format: {{"artists": [{{"artist_display_name": "...", "artist_gallery_url": "...", "is_represented": true/null}}]}}
+            try:
+                response = self.groq_client.chat.completions.create(
+                    model=self.groq_model,
+                    messages=[
+                        {"role": "system", "content": "You are a precise data extraction assistant. Your task is to extract ALL artist names from gallery websites with 100% completeness."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1,  # Slight variation between passes
+                )
+
+                content = response.choices[0].message.content
+                if content:
+                    parsed = json.loads(content)
+                    artists_data = parsed.get("artists", [])
+                    artists = []
+                    for artist_data in artists_data:
+                        display_name = artist_data.get("artist_display_name", "").strip()
+                        if display_name:
+                            artists.append(ArtistExtraction(
+                                artist_display_name=display_name,
+                                artist_gallery_url=resolve_url(
+                                    base_url, artist_data.get("artist_gallery_url")
+                                ),
+                                is_represented=artist_data.get("is_represented", True),
+                                normalized_name=display_name.lower().strip(),
+                            ))
+                    all_extractions.append(artists)
+
+            except Exception as e:
+                print(f"   ⚠️  Pass {pass_num + 1} failed: {e}")
+                all_extractions.append([])
+
+        # Merge using union - include all unique artists from all passes
+        merged = self._merge_extractions(all_extractions)
+        print(f"   ✓ Multi-pass extraction complete")
+
+        return merged
+
+    def _build_extraction_prompt(self, markdown: str, pass_num: int) -> str:
+        """Build extraction prompt with pass-specific strategies but full context."""
+        extraction_strategies = [
+            "Strategy: Carefully scan through the content once, extracting every artist name you see in order.",
+            "Strategy: Look specifically for markdown links in the format [Artist Name](url) - these are the primary artist listings.",
+            "Strategy: Verify by counting - scan for numbered lists, bullet points, or alphabet sections to ensure no artist was missed."
+        ]
+
+        return f"""Extract ALL artists from this gallery page. You must find every single artist with 100% completeness.
+
+{extraction_strategies[pass_num % len(extraction_strategies)]}
+
+Requirements:
+- Extract EVERY artist name from the complete content below
+- Look for patterns like "[Artist Name](https://.../artists/name)"
+- Check for bullet lists, numbered lists, or alphabetically organized sections
+- Count the total number of artists you found
+
+For each artist, return in JSON:
+- artist_display_name: The exact name as shown
+- artist_gallery_url: Full URL to their artist page
+- is_represented: true
+
+CRITICAL: Your response must include ALL artists from the content. Return valid JSON format: {{"artists": [{{"artist_display_name": "...", "artist_gallery_url": "...", "is_represented": true}}]}}
 
 ---
-{truncated_markdown}"""
+{markdown}"""
 
-        try:
-            response = self.groq_client.chat.completions.create(
-                model=self.groq_model,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            )
-
-            content = response.choices[0].message.content
-            if not content:
-                print("   ⚠️  LLM returned empty content")
-                return []
-            parsed = json.loads(content)
-            artists_data = parsed.get("artists", [])
-
-            # Convert to ArtistExtraction objects
-            artists = []
-            base_url = get_base_url(gallery_url)
-
-            for artist_data in artists_data:
-                artist = ArtistExtraction(
-                    artist_display_name=artist_data.get("artist_display_name", ""),
-                    artist_gallery_url=resolve_url(
-                        base_url, artist_data.get("artist_gallery_url")
-                    ),
-                    is_represented=artist_data.get("is_represented", True),
-                )
-                artists.append(artist)
-
-            print(f"   ✓ LLM extracted {len(artists)} artists")
-            return artists
-
-        except Exception as e:
-            print(f"   ⚠️  Error in LLM extraction: {e}")
+    def _merge_extractions(
+        self, extractions: List[List[ArtistExtraction]]
+    ) -> List[ArtistExtraction]:
+        """Merge multiple extraction passes using union with best-metadata selection."""
+        if not extractions:
             return []
+
+        if len(extractions) == 1:
+            return extractions[0]
+
+        # Build union of all artists, keeping the best metadata for duplicates
+        best_artist: dict[str, ArtistExtraction] = {}
+
+        for extraction in extractions:
+            for artist in extraction:
+                normalized = artist.normalized_name
+                if normalized not in best_artist:
+                    best_artist[normalized] = artist
+                else:
+                    # Prefer the version with a gallery URL
+                    existing = best_artist[normalized]
+                    if artist.artist_gallery_url and not existing.artist_gallery_url:
+                        best_artist[normalized] = artist
+
+        merged = list(best_artist.values())
+
+        # Sort by display name for consistent output
+        merged.sort(key=lambda a: a.artist_display_name.lower())
+
+        # Show extraction variance for debugging
+        for i, extraction in enumerate(extractions, 1):
+            print(f"   Pass {i}: {len(extraction)} artists")
+        print(f"   Union result: {len(merged)} unique artists")
+
+        return merged

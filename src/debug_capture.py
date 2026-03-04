@@ -2,52 +2,14 @@
 
 import asyncio
 import os
+import sys
 from datetime import datetime
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+from pathlib import Path
 
-# Scroll script with gradual scrolling for lazy loading
-GRADUAL_SCROLL_JS = """
-async () => {
-    const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-    let scrollHeight = document.body.scrollHeight;
-    const viewportHeight = window.innerHeight;
-    let currentPosition = 0;
-    let iterations = 0;
-    const maxIterations = 50;
-    
-    console.log(`Starting scroll. Initial height: ${scrollHeight}px`);
-    
-    // Scroll down gradually
-    while (currentPosition < scrollHeight && iterations < maxIterations) {
-        currentPosition += Math.floor(viewportHeight * 0.7);  // Scroll 70% of viewport
-        window.scrollTo(0, currentPosition);
-        await delay(1000);  // Wait for lazy loading
-        
-        // Update scroll height in case content was added
-        const newScrollHeight = document.body.scrollHeight;
-        if (newScrollHeight > scrollHeight) {
-            console.log(`Height expanded: ${scrollHeight} -> ${newScrollHeight}`);
-            scrollHeight = newScrollHeight;
-        }
-        
-        iterations++;
-    }
-    
-    console.log(`Scrolled to position ${currentPosition}/${scrollHeight} in ${iterations} iterations`);
-    
-    // Scroll back to top then down once more to ensure everything loaded
-    window.scrollTo(0, 0);
-    await delay(500);
-    window.scrollTo(0, document.body.scrollHeight);
-    await delay(1000);
-    
-    return {
-        scrollHeight: document.body.scrollHeight,
-        finalPosition: currentPosition,
-        iterations: iterations
-    };
-}
-"""
+sys.path.insert(0, str(Path(__file__).parent))
+
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+from utils import GRADUAL_SCROLL_JS
 
 
 async def capture_page(url: str, output_dir: str, name: str):
@@ -60,7 +22,7 @@ async def capture_page(url: str, output_dir: str, name: str):
     )
     
     crawl_config = CrawlerRunConfig(
-        wait_until="networkidle",
+        wait_until="domcontentloaded",
         page_timeout=60000,
         word_count_threshold=10,
         js_code=GRADUAL_SCROLL_JS,

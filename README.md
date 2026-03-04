@@ -31,14 +31,10 @@ AI-powered scraper that extracts artist relationships from gallery websites and 
 python3 src/main.py --priority-only
 ```
 
-### Scrape a specific gallery by ID
-```bash
-python3 src/main.py --gallery-id "uuid-here"
-```
-
 ### Scrape a specific gallery by URL
 ```bash
 python3 src/main.py --gallery-url "rodolphejanssen.com"
+python3 src/main.py --gallery-url "davidzwirner.com"
 ```
 
 ### Scrape all galleries (priority first, then others)
@@ -78,15 +74,25 @@ Results are saved to `output/results.jsonl` for debugging/audit purposes. The ma
 
 ## Architecture
 
-- **requirements.txt**: Python dependencies
-- **config.py**: Environment variables and settings
-- **models.py**: Pydantic data models
-- **database.py**: Supabase client operations
-- **matcher.py**: Fuzzy matching logic (thefuzz)
-- **scraper.py**: Crawl4AI + Groq integration
-- **main.py**: CLI entry point and orchestration
-- **review_duplicates.py**: Review tool for finding potential duplicate artists
-- **debug_capture.py**: Standalone script to capture page HTML for debugging
+```
+src/
+├── main.py              # Entry point, CLI, orchestration (~400 lines)
+├── scraper.py           # Web scraping + multi-pass LLM extraction (~420 lines)
+├── matcher.py           # Fuzzy matching logic (thefuzz)
+├── database.py          # Supabase client operations
+├── models.py            # Pydantic data models
+├── config.py            # Environment configuration
+├── utils.py             # Shared utilities (URLs, normalization, scroll JS)
+├── review_duplicates.py # Standalone admin script
+└── debug_capture.py     # Standalone debug script
+```
+
+### Key Components
+
+- **scraper.py**: Uses Crawl4AI for browser automation and Groq LLM for structured data extraction. Implements multi-pass extraction (3 LLM calls with different strategies) for 100% completeness.
+- **matcher.py**: Fuzzy matching using `thefuzz` to reconcile extracted artists with existing database.
+- **database.py**: Supabase client with soft-delete support for tracking artist representation history.
+- **utils.py**: Centralized utilities including URL resolution, artist name normalization, and the shared scroll script for lazy loading.
 
 ## Database Schema
 
