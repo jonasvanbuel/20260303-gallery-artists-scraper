@@ -97,19 +97,23 @@ class GalleryScraper:
 
         try:
             async with AsyncWebCrawler(config=browser_config) as crawler:
-                # First try /artists/index/ (usually has complete historical roster)
-                result = await crawler.arun(url=index_url, config=crawl_config)
-                if result.success and result.markdown and len(result.markdown) > 500:
-                    # Check for alphabetical index markers (### A, ### B, etc.)
-                    if re.search(r'### [A-Z]', result.markdown):
-                        print(f"   ✓ Found comprehensive index: {index_url}")
-                        return index_url
-
-                # Fall back to /artists/ (current roster only)
+                # Step 1: Try /artists/ first
                 result = await crawler.arun(url=artists_url, config=crawl_config)
                 if result.success and result.markdown and len(result.markdown) > 100:
+                    markdown = result.markdown.raw_markdown or result.markdown.fit_markdown
+
+                    # Step 2: Ask LLM to validate this page and check for better alternatives
+                    better_url = await self._llm_validate_artists_page(
+                        gallery, base_url, artists_url, markdown
+                    )
+
+                    if better_url and better_url != artists_url:
+                        # LLM found a better page (like /artists/index/)
+                        print(f"   ✓ LLM found better page: {better_url}")
+                        return better_url
+
                     # Quick check: does it look like an artists page?
-                    markdown_lower = result.markdown.lower()
+                    markdown_lower = markdown.lower()
                     artist_indicators = [
                         "artist",
                         "represented",
@@ -203,6 +207,76 @@ Only return a URL that appears in the content. Do not invent URLs.
         except Exception as e:
             print(f"   ⚠️  Error in LLM discovery for {gallery.name}: {e}")
             return None
+
+    async def _llm_validate_artists_page(
+        self, gallery: Gallery, base_url: str, current_url: str, markdown: str
+    ) -> Optional[str]:
+        """Use LLM to validate if current artists page is complete or suggest better alternative.
+
+        This provides intelligent page selection - the LLM can detect:
+        - Links to "See all artists", "Complete index", "A-Z listing"
+        - Pagination (Page 1 of 3, etc.)
+        - Alphabetical section markers (### A, ### B)
+        - Whether current page is comprehensive or partial
+
+        Returns the best URL to use for extraction (current or alternative).
+        """
+        # Build prompt for LLM analysis - pass FULL markdown, no truncation
+        # Groq has ~8K token context (~32K chars), most gallery pages are <30K
+        prompt = f"""Analyze this artists page for {gallery.name} and determine if this is the best page to extract ALL artists from, or if there's a better/more comprehensive page linked.
+
+Current page: {current_url}
+
+Look for these specific indicators:
+1. Links containing text like: "See all", "View all", "Complete list", "A-Z index", "Index", "All artists"
+2. Alphabetical sections with headers like "### A", "### B", "# A", "# B" (indicates comprehensive listing)
+3. Text like "Current artists", "Currently represented" (suggests partial listing, historical artists may be elsewhere)
+4. Pagination (Page 1 of X) suggesting partial content
+
+Return JSON: {{
+    "use_current_page": true/false,
+    "better_page_url": "https://..." or null,
+    "reason": "brief explanation"
+}}
+
+IMPORTANT: If you see any link with text like "See all artists" or "View complete list" or similar, those usually lead to a more comprehensive page with 2-3x more artists. Return that URL.
+
+If the current page has alphabetical A-Z sections (### A through ### Z), it's likely complete - return use_current_page=true.
+
+---
+{markdown}"""
+
+        try:
+            response = self.groq_client.chat.completions.create(
+                model=self.groq_model,
+                messages=[
+                    {"role": "system", "content": "You analyze gallery artists pages to find the most comprehensive listing."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+
+            content = response.choices[0].message.content
+            if not content:
+                return current_url  # Default to current if LLM fails
+
+            parsed = json.loads(content)
+            use_current = parsed.get("use_current_page", True)
+            better_url = parsed.get("better_page_url")
+
+            if not use_current and better_url:
+                # Resolve relative URL if needed
+                resolved = resolve_url(base_url, better_url)
+                if resolved and resolved != current_url:
+                    return resolved
+
+            return current_url
+
+        except Exception as e:
+            # If LLM fails, default to current page
+            print(f"   ⚠️  LLM validation failed: {e}, using current page")
+            return current_url
 
     async def _extract_artists(
         self, gallery: Gallery, gallery_url: str, artists_page_url: str
