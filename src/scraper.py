@@ -504,15 +504,17 @@ CRITICAL: Your response must include ALL artists from the content. Return valid 
         print(f"   ✓ Hybrid extraction complete: {len(classified)} artists")
         return classified
 
-    def _extract_all_artist_urls(self, markdown: str, base_url: str) -> Dict[str, str]:
+    def _extract_all_artist_urls(self, markdown: str, base_url: str) -> Dict[str, Tuple[str, str]]:
         """Extract all unique artist URLs from markdown using regex.
 
-        Returns: dict mapping artist_slug -> full_url
+        Returns: dict mapping artist_slug -> (artist_name, full_url)
+        The artist_name is extracted from the markdown link text (e.g., "[Artist Name](url)")
         """
         artists = {}
 
         # Pattern 1: Markdown links [Name](https://.../artists/name/)
         # Matches: [Artist Name](https://gallery.com/artists/name/)
+        # Also handles formats like: * ### [Artist Name](url)
         md_pattern = r'\[([^\]]+)\]\((https?://[^)]+/artists/([^/)]+))\)'
         for match in re.finditer(md_pattern, markdown):
             name = match.group(1).strip()
@@ -520,16 +522,19 @@ CRITICAL: Your response must include ALL artists from the content. Return valid 
             slug = match.group(3).rstrip('/')
 
             # Skip navigation/footer links
-            if len(name) < 2 or 'artists' in slug.lower() and slug.lower() in ['artists', 'artists-index']:
+            if len(name) < 2 or slug.lower() in ['artists', 'artists-index', 'index', '']:
                 continue
 
-            # Clean up name (remove image alt text artifacts)
+            # Clean up name (remove image alt text artifacts like ![alt])
             name = re.sub(r'!\[.*?\]', '', name).strip()
-            if name and slug:
-                artists[slug] = url
+            # Remove markdown formatting (###, ##, etc.)
+            name = re.sub(r'^#+\s*', '', name).strip()
 
-        # Pattern 2: Plain text URLs that look like artist pages
-        # https://gallery.com/artists/name/
+            if name and slug:
+                artists[slug] = (name, url)
+
+        # Pattern 2: Plain text URLs that look like artist pages (fallback)
+        # Only use this if we didn't already find the artist via markdown link
         url_pattern = r'(https?://[^\s\)\"\'\[\]\,]+/artists/([^\s\)\"\'\[\]\,\/</]+))'
         for match in re.finditer(url_pattern, markdown):
             url = match.group(1).rstrip('/')
@@ -537,21 +542,25 @@ CRITICAL: Your response must include ALL artists from the content. Return valid 
 
             # Skip duplicates and non-artist pages
             if slug not in artists and not any(x in slug.lower() for x in ['index', 'page', 'search']):
-                artists[slug] = url
+                # Convert slug to display name as fallback
+                display_name = self._slug_to_display_name(slug)
+                artists[slug] = (display_name, url)
 
         return artists
 
     def _slug_to_display_name(self, slug: str) -> str:
-        """Convert URL slug to display name."""
+        """Convert URL slug to display name. Only used as fallback when markdown doesn't have [Name](url) format."""
         # Decode URL encoding
         decoded = unquote(slug)
         # Replace hyphens with spaces
         name = decoded.replace('-', ' ')
+        # Remove trailing spaces that might come from %20
+        name = name.strip()
         # Capitalize each word
         return ' '.join(word.capitalize() for word in name.split())
 
     async def _classify_artists_with_llm(
-        self, artists: Dict[str, str], markdown: str, gallery: Gallery
+        self, artists: Dict[str, Tuple[str, str]], markdown: str, gallery: Gallery
     ) -> List[ArtistExtraction]:
         """Use LLM to classify artists as represented vs projects.
 
@@ -561,18 +570,10 @@ CRITICAL: Your response must include ALL artists from the content. Return valid 
         # Focus on finding section markers like "(Projects)" or "Also Available"
         section_markers = re.findall(r'[\(\*\#]\s*(?:Projects|Also Available|Formerly|Previously)[\)\*\#]?[^\n]*', markdown, re.IGNORECASE)
 
-        # Build context about sections
-        context = f"""Gallery: {gallery.name}
-
-Section markers found in page: {', '.join(section_markers) if section_markers else 'None explicit'}
-
-Artist list to classify:
-"""
-
         # Build result list with default represented=True
+        # artists dict is: slug -> (display_name, url)
         result = []
-        for slug, url in artists.items():
-            display_name = self._slug_to_display_name(slug)
+        for slug, (display_name, url) in artists.items():
             result.append(ArtistExtraction(
                 artist_display_name=display_name,
                 artist_gallery_url=url,
