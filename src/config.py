@@ -39,6 +39,18 @@ class Config:
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+    # LLM Chunk Processing (for large galleries with many artists)
+    # Max characters per chunk to stay within token limits
+    LLM_MAX_CHUNK_SIZE: int = int(os.getenv("LLM_MAX_CHUNK_SIZE", "8000"))
+    # Overlap between chunks to avoid missing artists at boundaries
+    LLM_CHUNK_OVERLAP: int = int(os.getenv("LLM_CHUNK_OVERLAP", "2000"))
+
+    # Multi-Pass LLM Configuration (for high-accuracy extraction)
+    LLM_PASS1_MODEL: str = os.getenv("LLM_PASS1_MODEL", "llama-3.3-70b-versatile")
+    LLM_PASS2_MODEL: str = os.getenv("LLM_PASS2_MODEL", "openai/gpt-oss-120b")
+    LLM_PASS3_MODEL: str = os.getenv("LLM_PASS3_MODEL", "llama-3.3-70b-versatile")
+    LLM_CONSENSUS_THRESHOLD: float = float(os.getenv("LLM_CONSENSUS_THRESHOLD", "0.90"))
+
     # Output
     OUTPUT_DIR: Path = Path("output")
 

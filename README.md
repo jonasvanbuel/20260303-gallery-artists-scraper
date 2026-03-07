@@ -33,7 +33,7 @@ python3 src/main.py --priority-only
 
 ### Scrape a specific gallery by URL
 ```bash
-python3 src/main.py --gallery-url "rodolphejanssen.com"
+python3 src/main.py --gallery-url "rodolphejanssen.com" --dry-run
 python3 src/main.py --gallery-url "davidzwirner.com"
 ```
 
@@ -208,14 +208,24 @@ pip install -r requirements.txt
 
 Tested galleries and their artist counts (as of March 2026):
 
-| Gallery | Artists | URL |
-|---------|---------|-----|
-| **Gagosian** | 291 | gagosian.com |
-| **Almine Rech** | 106 | alminerech.com |
-| **David Zwirner** | 85 | davidzwirner.com |
-| **Andrew Kreps Gallery** | 40 | andrewkreps.com |
-| **Thomas Dane Gallery** | 38 | thomasdanegallery.com |
-| **Antenna Space** | 27 | antenna-space.com |
-| **Axel Vervoordt Gallery** | 55 | axelvervoordtgallery.com |
+| Gallery | Artists | URL | Verification Date |
+|---------|---------|-----|---------------------|
+| **Gagosian** | 296 | gagosian.com | 2026-03-06 (multi-pass) |
+| **Almine Rech** | 106 | alminerech.com | 2026-03-06 (100% consensus) |
+| **David Zwirner** | 85 | davidzwirner.com | 2026-03-06 (tie-breaker) |
+| **Andrew Kreps Gallery** | 40 | andrewkreps.com | 2026-03-06 (100% consensus) |
+| **Thomas Dane Gallery** | 38 | thomasdanegallery.com | 2026-03-06 (100% consensus) |
+| **Antenna Space** | 25 | antenna-space.com | 2026-03-06 (100% consensus) |
+| **Axel Vervoordt Gallery** | 55 | axelvervoordtgallery.com | 2026-03-06 (100% consensus) |
 
-*Note: These counts are for reference only and may change as galleries update their rosters.*
+Manual counts:
+
+Gagosian: 296
+Almine Rech: 106
+David Zwirner: 85
+Andrew Kreps: 40
+Thomas Dane: 38
+Antenna: 25
+Axel Vervoordt: 55
+
+*Verification Method: Multi-pass LLM extraction with model consensus (Llama 3.3 70B + GPT OSS 120B + tie-breaker when needed). Counts may change as galleries update their rosters.*
