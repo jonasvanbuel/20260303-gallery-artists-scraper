@@ -79,7 +79,7 @@ class GalleryScraper:
         base_url = get_base_url(gallery_url)
 
         # Try /artists/index/ first (usually has complete historical roster)
-        index_url = f"{base_url}/artists/index/"
+        index_url = f"{base_url}/artists(?:-[^/]+)?/index/"
         artists_url = f"{base_url}/artists"
 
         browser_config = BrowserConfig(
@@ -377,16 +377,6 @@ If the current page has alphabetical A-Z sections (### A through ### Z), it's li
 
         return None
 
-    async def _llm_extract_artists(
-        self, gallery: Gallery, gallery_url: str, markdown: str
-    ) -> List[ArtistExtraction]:
-        """Extract artists using hybrid approach: regex for discovery, LLM for classification.
-
-        This guarantees 100% artist coverage (no LLM misses) while still using
-        LLM intelligence for section classification (represented vs projects).
-        """
-        # Use hybrid extraction (regex + LLM classification)
-        return await self._hybrid_extract_artists(gallery, gallery_url, markdown)
 
     def _split_into_chunks(self, markdown: str, chunk_size: int, overlap: int) -> List[str]:
         """Split markdown into overlapping chunks to ensure no artists are lost at boundaries."""
@@ -478,31 +468,292 @@ CRITICAL: Your response must include ALL artists from the content. Return valid 
 
         return merged
 
-    async def _hybrid_extract_artists(
+    def _split_markdown_into_chunks(
+        self, markdown: str, chunk_size: int, overlap: int
+    ) -> List[str]:
+        """Split markdown into overlapping chunks for processing.
+
+        Each chunk has an overlap with the previous chunk to ensure artists
+        at chunk boundaries aren't missed.
+        """
+        if len(markdown) <= chunk_size:
+            return [markdown]
+
+        chunks = []
+        start = 0
+
+        while start < len(markdown):
+            # Find the end of this chunk
+            end = start + chunk_size
+
+            if end >= len(markdown):
+                # Last chunk - take remaining content
+                chunks.append(markdown[start:])
+                break
+
+            # Find a good break point (end of line) within the chunk
+            # Look for newline before the chunk end
+            break_point = markdown.rfind('\n', start, end)
+
+            if break_point == -1 or break_point <= start:
+                # No good break point found, use the chunk end
+                break_point = end
+
+            # Add chunk
+            chunks.append(markdown[start:break_point])
+
+            # Move start position, accounting for overlap
+            # Next chunk starts at (current break_point - overlap)
+            start = max(start + 1, break_point - overlap)
+
+        return chunks
+
+    async def _llm_extract_artists_from_chunk_with_model(
+        self, gallery: Gallery, chunk: str, chunk_num: int, total_chunks: int,
+        model: str, pass_num: int
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Extract artists from a single markdown chunk using specified LLM model.
+
+        Returns: (artists_list, excluded_list)
+        """
+        # Adjust prompt based on pass number (different strategies)
+        strategies = [
+            "Focus on comprehensive coverage - extract every artist you can find.",
+            "Focus on precision - carefully verify each artist link and avoid duplicates.",
+            "Focus on thoroughness - double-check for any artists that might have been missed."
+        ]
+        strategy = strategies[(pass_num - 1) % len(strategies)]
+
+        prompt = f"""You are extracting artist information from {gallery.name} website.
+
+Extract ALL artist names and their URLs from this section of the gallery's markdown content.
+This is chunk {chunk_num} of {total_chunks}, processing pass {pass_num}.
+
+{strategy}
+
+Common URL patterns for artist pages include:
+- /artists/artist-name
+- /artists-work/artist-name
+- /artist/artist-name
+- /roster/artist-name
+- /people/artist-name
+- /works/artist-name
+
+EXCLUDE these UI/navigation elements:
+- View modes: "list", "grid", "table", "view"
+- Navigation: "next", "previous", "home", "menu"
+- Generic terms: "all", "index", "default"
+- Single-character paths (like "/c/", "/p/")
+
+IMPORTANT:
+- Only include ACTUAL person names (artists represented by the gallery)
+- Artist names should be in Title Case (e.g., "John Smith", "Jane Doe")
+- Return the full absolute URL for each artist
+- If a name has "Estate" or similar suffix, include it (e.g., "Will Barnet Estate")
+
+Markdown content (chunk {chunk_num}/{total_chunks}, pass {pass_num}):
+```markdown
+{chunk}
+```
+
+Return JSON:
+{{
+  "artists": [
+    {{
+      "name": "Artist Name",
+      "url": "https://gallery.com/artists/artist-name"
+    }}
+  ],
+  "excluded": [
+    {{
+      "name": "Grid",
+      "reason": "UI element - view toggle"
+    }}
+  ]
+}}
+
+Rules:
+- Include ALL artists found in this chunk
+- Use the EXACT name as displayed on the page (with proper capitalization)
+- Include complete URLs (with https://)
+- Be thorough - check all sections and links
+- When uncertain if something is an artist, include it (better to keep than miss)"""
+
+        try:
+            response = self.groq_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You extract artist names and URLs from gallery website markdown. Return structured JSON with artist names and their page URLs. Be thorough and accurate."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+
+            content = response.choices[0].message.content
+            if not content:
+                return [], []
+
+            parsed = json.loads(content)
+            artists_data = parsed.get('artists', [])
+            excluded_data = parsed.get('excluded', [])
+
+            return artists_data, excluded_data
+
+        except Exception as e:
+            print(f"   ⚠️  LLM chunk {chunk_num} failed with model {model}: {e}")
+            return [], []
+
+    async def _llm_extract_artists(
         self, gallery: Gallery, gallery_url: str, markdown: str
     ) -> List[ArtistExtraction]:
-        """Hybrid extraction: regex for 100% artist discovery, LLM for classification.
+        """Multi-pass LLM extraction with model consensus for high accuracy.
 
-        This approach guarantees all artists are found (no LLM misses) while
-        still using LLM to classify represented vs projects and detect section headers.
+        Pass 1: Primary model (llama-3.3-70b)
+        Pass 2: Secondary model (qwen-2.5-32b)
+        Pass 3 (if needed): Tie-breaker model for discrepancies
         """
-        print(f"   Using hybrid extraction ({len(markdown)} chars)...")
+        print(f"   Using multi-pass LLM extraction ({len(markdown)} chars)...")
 
-        base_url = get_base_url(gallery_url)
+        # Get configuration
+        chunk_size = Config.LLM_MAX_CHUNK_SIZE
+        overlap = Config.LLM_CHUNK_OVERLAP
+        threshold = Config.LLM_CONSENSUS_THRESHOLD
 
-        # Phase 1: Deterministic extraction of ALL artist URLs
-        all_artists = self._extract_all_artist_urls(markdown, base_url)
-        print(f"   🔍 Regex found {len(all_artists)} unique artist URLs")
+        # Split into chunks if necessary
+        chunks = self._split_markdown_into_chunks(markdown, chunk_size, overlap)
+        total_chunks = len(chunks)
 
-        if not all_artists:
-            return []
+        if total_chunks > 1:
+            print(f"   📦 Split into {total_chunks} chunks (size: {chunk_size}, overlap: {overlap})")
 
-        # Phase 2: LLM classification on smaller chunks
-        # Classify artists in batches to determine is_represented status
-        classified = await self._classify_artists_with_llm(all_artists, markdown, gallery)
+        # PASS 1: Primary model
+        print(f"   🔄 Pass 1/3: {Config.LLM_PASS1_MODEL}...")
+        pass1_artists = await self._run_extraction_pass(
+            gallery, chunks, Config.LLM_PASS1_MODEL, 1
+        )
+        print(f"      ✓ Pass 1 found {len(pass1_artists)} artists")
 
-        print(f"   ✓ Hybrid extraction complete: {len(classified)} artists")
-        return classified
+        # PASS 2: Secondary model (different architecture)
+        print(f"   🔄 Pass 2/3: {Config.LLM_PASS2_MODEL}...")
+        pass2_artists = await self._run_extraction_pass(
+            gallery, chunks, Config.LLM_PASS2_MODEL, 2
+        )
+        print(f"      ✓ Pass 2 found {len(pass2_artists)} artists")
+
+        # Compare pass 1 and pass 2
+        similarity = self._calculate_similarity(pass1_artists, pass2_artists)
+        print(f"   📊 Similarity between passes: {similarity:.1%}")
+
+        if similarity >= threshold:
+            print(f"   ✅ Passes match (≥{threshold:.0%}), using consensus result")
+            return self._merge_passes([pass1_artists, pass2_artists])
+
+        # PASS 3: Tie-breaker needed
+        print(f"   ⚠️  Passes differ ({similarity:.1%} < {threshold:.0%}), running tie-breaker...")
+        print(f"   🔄 Pass 3/3: {Config.LLM_PASS3_MODEL} (tie-breaker)...")
+        pass3_artists = await self._run_extraction_pass(
+            gallery, chunks, Config.LLM_PASS3_MODEL, 3
+        )
+        print(f"      ✓ Pass 3 found {len(pass3_artists)} artists")
+
+        # Majority voting: Use the result that matches best with the other two
+        sim_1_3 = self._calculate_similarity(pass1_artists, pass3_artists)
+        sim_2_3 = self._calculate_similarity(pass2_artists, pass3_artists)
+
+        print(f"   📊 Similarity Pass 1↔3: {sim_1_3:.1%}, Pass 2↔3: {sim_2_3:.1%}")
+
+        if sim_1_3 >= sim_2_3:
+            print(f"   ✅ Using Pass 1 + Pass 3 consensus (higher similarity)")
+            return self._merge_passes([pass1_artists, pass3_artists])
+        else:
+            print(f"   ✅ Using Pass 2 + Pass 3 consensus (higher similarity)")
+            return self._merge_passes([pass2_artists, pass3_artists])
+
+    async def _run_extraction_pass(
+        self, gallery: Gallery, chunks: List[str], model: str, pass_num: int
+    ) -> List[Tuple[str, str]]:
+        """Run a single extraction pass with specified model.
+
+        Returns list of (name, url) tuples.
+        """
+        all_artists = []
+        total_chunks = len(chunks)
+
+        for i, chunk in enumerate(chunks, 1):
+            if total_chunks > 1:
+                print(f"      Processing chunk {i}/{total_chunks}...")
+
+            artists_data, _ = await self._llm_extract_artists_from_chunk_with_model(
+                gallery, chunk, i, total_chunks, model, pass_num
+            )
+
+            for artist in artists_data:
+                name = artist.get('name', '').strip()
+                url = artist.get('url', '').strip()
+                if name and url:
+                    all_artists.append((name, url))
+
+        # Deduplicate within this pass
+        seen_urls = set()
+        deduplicated = []
+        for name, url in all_artists:
+            normalized_url = url.rstrip('/').lower()
+            if normalized_url not in seen_urls:
+                seen_urls.add(normalized_url)
+                deduplicated.append((name, url))
+
+        return deduplicated
+
+    def _calculate_similarity(
+        self, artists1: List[Tuple[str, str]], artists2: List[Tuple[str, str]]
+    ) -> float:
+        """Calculate Jaccard similarity between two artist lists based on URLs.
+
+        Returns value between 0.0 and 1.0
+        """
+        if not artists1 and not artists2:
+            return 1.0  # Both empty = perfect match
+        if not artists1 or not artists2:
+            return 0.0  # One empty, one not = no match
+
+        # Create sets of normalized URLs
+        urls1 = {url.rstrip('/').lower() for _, url in artists1}
+        urls2 = {url.rstrip('/').lower() for _, url in artists2}
+
+        # Jaccard similarity: |intersection| / |union|
+        intersection = urls1 & urls2
+        union = urls1 | urls2
+
+        return len(intersection) / len(union) if union else 0.0
+
+    def _merge_passes(
+        self, passes: List[List[Tuple[str, str]]]
+    ) -> List[ArtistExtraction]:
+        """Merge multiple extraction passes, keeping all unique artists.
+
+        Uses union of all artists found across passes.
+        """
+        # Collect all unique artists by URL
+        seen_urls = set()
+        merged = []
+
+        for pass_artists in passes:
+            for name, url in pass_artists:
+                normalized_url = url.rstrip('/').lower()
+                if normalized_url not in seen_urls:
+                    seen_urls.add(normalized_url)
+                    # Clean up name
+                    cleaned_name = self._clean_artist_name(name)
+                    merged.append(ArtistExtraction(
+                        artist_display_name=cleaned_name,
+                        artist_gallery_url=url,
+                        is_represented=True,
+                        normalized_name=cleaned_name.lower().strip(),
+                    ))
+
+        print(f"   ✓ Multi-pass extraction complete: {len(merged)} unique artists")
+        return merged
 
     def _extract_all_artist_urls(self, markdown: str, base_url: str) -> Dict[str, Tuple[str, str]]:
         """Extract all unique artist URLs from markdown using regex.
@@ -529,7 +780,8 @@ CRITICAL: Your response must include ALL artists from the content. Return valid 
         # Handles formats like: * [ ![](image_url) Artist Name ](artist_url)
         # The pattern captures the name from link text, not from the URL slug
         # Note: URLs may end with /) so we make the trailing slash optional
-        md_pattern_img = r'\[\s*(!\[[^\]]*\]\([^)]+\))\s*([^\]]+?)\s*\]\((https?://[^)]+/artists/([^/)]+)/?)\)'
+        # Supports both /artists(?:-[^/]+)?/ and /artists-work/ (or any /artists-*/ variant)
+        md_pattern_img = r'\[\s*(!\[[^\]]*\]\([^)]+\))\s*([^\]]+?)\s*\]\((https?://[^)]+/artists(?:-[^/]+)?/([^/)]+)/?)\)'
         for match in re.finditer(md_pattern_img, markdown):
             name = match.group(2).strip()  # Group 2 is the artist name from link text
             url = match.group(3)  # Group 3 is the URL
@@ -557,9 +809,10 @@ CRITICAL: Your response must include ALL artists from the content. Return valid 
             if name and slug:
                 artists[slug] = (name, url)
 
-        # Pattern 2: Simple markdown links [Name](https://.../artists/name/)
+        # Pattern 2: Simple markdown links [Name](https://.../artists(?:-[^/]+)?/name/)
         # For galleries without image tags in links
-        md_pattern_simple = r'\[([^\]]+)\]\((https?://[^)]+/artists/([^/)]+))\)'
+        # Supports both /artists(?:-[^/]+)?/ and /artists-work/ (or any /artists-*/ variant)
+        md_pattern_simple = r'\[([^\]]+)\]\((https?://[^)]+/artists(?:-[^/]+)?/([^/)]+))\)'
         for match in re.finditer(md_pattern_simple, markdown):
             name = match.group(1).strip()
             url = match.group(2)
@@ -593,7 +846,7 @@ CRITICAL: Your response must include ALL artists from the content. Return valid 
 
         # Pattern 3: Plain text URLs that look like artist pages (fallback)
         # Only use this if we didn't already find the artist via markdown link
-        url_pattern = r'(https?://[^\s\)\"\'\[\]\,]+/artists/([^\s\)\"\'\[\]\,\/</]+))'
+        url_pattern = r'(https?://[^\s\)\"\'\[\]\,]+/artists(?:-[^/]+)?/([^\s\)\"\'\[\]\,\/</]+))'
         for match in re.finditer(url_pattern, markdown):
             url = match.group(1).rstrip('/')
             slug = match.group(2).rstrip('/')
@@ -723,3 +976,60 @@ When unsure, default to true (represented)."""
                 print(f"   ⚠️  LLM classification failed: {e}, using defaults")
 
         return result
+
+    def _filter_ui_elements(
+        self, artists: Dict[str, Tuple[str, str]]
+    ) -> Dict[str, Tuple[str, str]]:
+        """Filter out obvious UI/navigation elements using a denylist.
+
+        Uses a conservative approach - only removes clearly non-artist terms
+        like "list", "grid", "view". When uncertain, keeps the entry.
+        """
+        if not artists:
+            return {}
+
+        # Strict denylist of obvious UI terms only
+        # These are clearly view modes, navigation, or generic labels
+        ui_slugs = {
+            'list', 'grid', 'table', 'view',  # View modes
+            'all', 'artists', 'index',  # Generic collection terms
+            'next', 'previous', 'prev', 'back', 'forward',  # Navigation
+            'home', 'menu', 'nav', 'navigation',  # Navigation
+            'default', 'undefined', 'null',  # Placeholders
+            'search', 'filter', 'sort',  # UI actions
+            '#main_content', 'main-content', 'skip',  # Accessibility
+        }
+
+        # Also check display names (lowercase)
+        ui_names = {
+            'list', 'grid', 'table', 'view',
+            'all artists', 'artists', 'index',
+            'next', 'previous', 'prev',
+            'home', 'menu',
+            'skip to main content', 'main content',
+        }
+
+        filtered = {}
+        removed = []
+
+        for slug, (display_name, url) in artists.items():
+            slug_lower = slug.lower().strip('/')
+            name_lower = display_name.lower().strip()
+
+            # Check against denylist
+            if slug_lower in ui_slugs or name_lower in ui_names:
+                removed.append(display_name)
+                continue
+
+            # Filter single-character slugs (likely navigation/UI paths like /c/, /p/)
+            if len(slug_lower) == 1:
+                removed.append(display_name)
+                continue
+
+            # Keep everything else (conservative approach)
+            filtered[slug] = (display_name, url)
+
+        if removed:
+            print(f"   🗑️  Filtered UI elements: {', '.join(removed[:5])}{'...' if len(removed) > 5 else ''}")
+
+        return filtered
